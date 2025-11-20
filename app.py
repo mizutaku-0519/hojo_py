@@ -5,6 +5,12 @@ import httpx
 from typing import Dict, Any, List, Optional
 import asyncio
 from datetime import datetime
+import warnings
+import urllib3
+
+# SSL警告を抑制（企業プロキシ環境対応）
+warnings.filterwarnings('ignore', message='Unverified HTTPS request')
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ページ設定
 st.set_page_config(
@@ -19,55 +25,85 @@ if 'search_results' not in st.session_state:
 if 'subsidy_detail' not in st.session_state:
     st.session_state.subsidy_detail = None
 
-# MCP Server URL
-MCP_BASE_URL = "http://127.0.0.1:8000"
+# JグランツAPI URL（MCPサーバーを経由せず直接APIを呼び出す）
+API_BASE_URL = "https://api.jgrants-portal.go.jp/exp/v1/public"
 
 
-async def call_mcp_tool(tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """MCP サーバーのツールを呼び出す"""
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # MCPプロトコルに従ったリクエストを送信
-            mcp_request = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {
-                    "name": tool_name,
-                    "arguments": params
-                }
-            }
+async def call_jgrants_api(endpoint: str, params: Dict[str, Any] = None, max_retries: int = 3) -> Dict[str, Any]:
+    """Jグランツ公開APIを直接呼び出す（リトライ機能付き）"""
 
-            response = await client.post(
-                f"{MCP_BASE_URL}/mcp",
-                json=mcp_request,
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept": "application/json, text/event-stream"
-                }
-            )
-            response.raise_for_status()
-            result = response.json()
+    for attempt in range(max_retries):
+        try:
+            # SSL証明書検証を無効化（企業プロキシ環境対応）
+            async with httpx.AsyncClient(
+                timeout=60.0,  # タイムアウトを60秒に延長
+                verify=False,
+                follow_redirects=True
+            ) as client:
+                url = f"{API_BASE_URL}{endpoint}"
 
-            # MCPレスポンスから結果を抽出
-            if "result" in result:
-                content = result["result"].get("content", [])
-                if content and len(content) > 0:
-                    # テキストコンテンツからJSONをパース
-                    import json
-                    text_content = content[0].get("text", "{}")
-                    return json.loads(text_content)
-                return {"error": "空のレスポンス"}
-            elif "error" in result:
-                return {"error": result["error"].get("message", "不明なエラー")}
+                # デバッグ情報（開発環境のみ）
+                if st.session_state.get('debug_mode', False):
+                    st.info(f"🔍 API呼び出し (試行 {attempt + 1}/{max_retries}): {url}")
+                    st.code(f"パラメータ: {params}")
 
-            return result
-    except httpx.ConnectError:
-        return {"error": "MCPサーバーに接続できません。サーバーが起動しているか確認してください。"}
-    except httpx.HTTPStatusError as e:
-        return {"error": f"HTTPエラー: {e.response.status_code}"}
-    except Exception as e:
-        return {"error": f"エラーが発生しました: {str(e)}"}
+                response = await client.get(url, params=params)
+
+                # デバッグ情報
+                if st.session_state.get('debug_mode', False):
+                    st.info(f"📡 ステータスコード: {response.status_code}")
+
+                response.raise_for_status()
+
+                # レスポンスの内容を確認
+                try:
+                    data = response.json()
+                    return data
+                except Exception as json_error:
+                    return {"error": f"JSONパースエラー: {str(json_error)}, レスポンス: {response.text[:200]}"}
+
+        except httpx.ConnectTimeout:
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)  # 指数バックオフ
+                continue
+            return {"error": "接続タイムアウト: JグランツAPIサーバーへの接続に時間がかかりすぎています"}
+
+        except httpx.ReadTimeout:
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return {"error": "読み取りタイムアウト: APIからのレスポンスに時間がかかりすぎています"}
+
+        except httpx.ConnectError as e:
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return {"error": f"JグランツAPIに接続できません: {str(e)}"}
+
+        except httpx.HTTPStatusError as e:
+            error_detail = ""
+            try:
+                error_detail = f" - {e.response.text[:200]}"
+            except:
+                pass
+
+            # 4xxエラーはリトライしない
+            if 400 <= e.response.status_code < 500:
+                return {"error": f"HTTPエラー: {e.response.status_code}{error_detail}"}
+
+            # 5xxエラーはリトライ
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return {"error": f"HTTPエラー: {e.response.status_code}{error_detail}"}
+
+        except Exception as e:
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return {"error": f"予期しないエラー: {str(e)}"}
+
+    return {"error": "最大リトライ回数に達しました"}
 
 
 def format_date(date_str: Optional[str]) -> str:
@@ -133,14 +169,15 @@ def main():
 
         st.markdown("---")
 
-        # 統計情報ボタン
-        if st.button("📊 統計情報を表示", use_container_width=True):
-            with st.spinner("統計情報を取得中..."):
-                result = asyncio.run(call_mcp_tool("get_subsidy_overview", {"output_format": "json"}))
-                if "error" in result:
-                    st.error(f"エラー: {result['error']}")
-                else:
-                    st.session_state.statistics = result
+        # デバッグモード
+        if 'debug_mode' not in st.session_state:
+            st.session_state.debug_mode = False
+
+        debug_mode = st.checkbox("🔧 デバッグモード", value=st.session_state.debug_mode)
+        st.session_state.debug_mode = debug_mode
+
+        if debug_mode:
+            st.caption("API呼び出しの詳細情報を表示します")
 
     # メインエリア
     if search_button and keyword:
@@ -148,7 +185,7 @@ def main():
             "keyword": keyword,
             "sort": sort_options[sort],
             "order": "ASC" if order == "昇順" else "DESC",
-            "acceptance": 1 if acceptance else 0
+            "acceptance": str(1 if acceptance else 0)
         }
 
         # オプションパラメータの追加
@@ -160,11 +197,16 @@ def main():
             params["target_area_search"] = area
 
         with st.spinner("検索中..."):
-            result = asyncio.run(call_mcp_tool("search_subsidies", params))
+            result = asyncio.run(call_jgrants_api("/subsidies", params))
             if "error" in result:
                 st.error(f"エラー: {result['error']}")
             else:
-                st.session_state.search_results = result
+                # APIレスポンスを整形
+                formatted_result = {
+                    "total_count": len(result.get("result", [])),
+                    "subsidies": result.get("result", [])
+                }
+                st.session_state.search_results = formatted_result
 
     # 統計情報の表示
     if 'statistics' in st.session_state:
@@ -210,8 +252,93 @@ def main():
 
         st.markdown("---")
 
+    # 詳細情報の表示（検索結果より先に表示）
+    if st.session_state.subsidy_detail:
+        detail = st.session_state.subsidy_detail
+
+        st.markdown("---")
+        st.header("📄 補助金詳細情報")
+
+        # 閉じるボタン
+        if st.button("❌ 閉じる"):
+            st.session_state.subsidy_detail = None
+            st.rerun()
+
+        st.subheader(detail.get('title', '無題'))
+
+        # ステータス判定
+        end_raw = detail.get("acceptance_end_datetime")
+        status = "受付終了"
+        if end_raw:
+            try:
+                end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+                if end_dt >= datetime.now(end_dt.tzinfo):
+                    status = "受付中"
+            except:
+                status = "受付中"
+
+        if status == "受付中":
+            st.success(f"✅ {status}")
+        else:
+            st.error(f"❌ {status}")
+
+        # 基本情報
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write(f"**補助金ID:** {detail.get('id', 'N/A')}")
+            st.write(f"**補助上限額:** {detail.get('subsidy_max_limit', '未設定')}")
+            st.write(f"**受付開始:** {format_date(detail.get('acceptance_start_datetime'))}")
+            st.write(f"**受付終了:** {format_date(detail.get('acceptance_end_datetime'))}")
+
+        with col2:
+            st.write(f"**対象地域:** {detail.get('target_area_search', '未設定')}")
+            st.write(f"**対象業種:** {detail.get('target_industry', '未設定')}")
+            st.write(f"**従業員数:** {detail.get('target_number_of_employees', '未設定')}")
+            st.write(f"**利用目的:** {detail.get('use_purpose', '未設定')}")
+
+        # 詳細説明
+        if detail.get('detail'):
+            st.subheader("📝 詳細説明")
+            st.markdown(detail['detail'], unsafe_allow_html=True)
+
+        # 添付ファイル（APIから直接取得したファイル情報を表示）
+        file_types = {
+            "application_guidelines": "📋 申請ガイドライン",
+            "outline_of_grant": "📄 補助金概要",
+            "application_form": "📝 申請書類"
+        }
+
+        has_files = False
+        for file_key in file_types.keys():
+            if detail.get(file_key):
+                has_files = True
+                break
+
+        if has_files:
+            st.subheader("📎 添付ファイル")
+            st.info("ℹ️ ファイルはBASE64形式で提供されています。MCPサーバー経由でMarkdown変換が可能です。")
+
+            for file_key, label in file_types.items():
+                file_list = detail.get(file_key, [])
+                if file_list:
+                    st.write(f"**{label}**")
+                    for file_data in file_list:
+                        if isinstance(file_data, dict):
+                            file_name = file_data.get('name', 'unknown')
+                            st.write(f"- {file_name}")
+                            st.caption("ファイルのダウンロード・変換にはMCPサーバーを使用してください")
+
+        # 申請URL
+        if detail.get('inquiry_url'):
+            st.subheader("🔗 申請ページ")
+            st.markdown(f"[申請ページを開く]({detail['inquiry_url']})")
+
+        # 最終更新日時
+        if detail.get('update_datetime'):
+            st.caption(f"最終更新: {format_date(detail['update_datetime'])}")
+
     # 検索結果の表示
-    if st.session_state.search_results:
+    elif st.session_state.search_results:
         results = st.session_state.search_results
 
         st.header(f"🔍 検索結果: {results.get('total_count', 0)}件")
@@ -252,104 +379,18 @@ def main():
                         # 詳細表示ボタン
                         if st.button(f"詳細を表示", key=f"detail_{idx}"):
                             with st.spinner("詳細情報を取得中..."):
-                                detail = asyncio.run(call_mcp_tool(
-                                    "get_subsidy_detail",
-                                    {"subsidy_id": subsidy.get('id')}
-                                ))
-                                if "error" in detail:
-                                    st.error(f"エラー: {detail['error']}")
+                                subsidy_id = subsidy.get('id')
+                                detail_result = asyncio.run(call_jgrants_api(f"/subsidies/id/{subsidy_id}"))
+                                if "error" in detail_result:
+                                    st.error(f"エラー: {detail_result['error']}")
                                 else:
-                                    st.session_state.subsidy_detail = detail
-                                    st.rerun()
-
-    # 詳細情報の表示
-    if st.session_state.subsidy_detail:
-        detail = st.session_state.subsidy_detail
-
-        st.markdown("---")
-        st.header("📄 補助金詳細情報")
-
-        # 閉じるボタン
-        if st.button("❌ 閉じる"):
-            st.session_state.subsidy_detail = None
-            st.rerun()
-
-        st.subheader(detail.get('title', '無題'))
-
-        # ステータス表示
-        status = detail.get('status', '不明')
-        if status == "受付中":
-            st.success(f"✅ {status}")
-        else:
-            st.error(f"❌ {status}")
-
-        # 基本情報
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write(f"**補助金ID:** {detail.get('id', 'N/A')}")
-            st.write(f"**補助上限額:** {detail.get('subsidy_max_limit', '未設定')}")
-            st.write(f"**受付開始:** {format_date(detail.get('acceptance_start'))}")
-            st.write(f"**受付終了:** {format_date(detail.get('acceptance_end'))}")
-
-        with col2:
-            target = detail.get('target', {})
-            st.write(f"**対象地域:** {target.get('area', '未設定')}")
-            st.write(f"**対象業種:** {target.get('industry', '未設定')}")
-            st.write(f"**従業員数:** {target.get('employees', '未設定')}")
-            st.write(f"**利用目的:** {target.get('purpose', '未設定')}")
-
-        # 詳細説明
-        if detail.get('description'):
-            st.subheader("📝 詳細説明")
-            st.markdown(detail['description'], unsafe_allow_html=True)
-
-        # 添付ファイル
-        files = detail.get('files', {})
-        if any(files.values()):
-            st.subheader("📎 添付ファイル")
-
-            file_type_labels = {
-                "application_guidelines": "📋 申請ガイドライン",
-                "outline_of_grant": "📄 補助金概要",
-                "application_form": "📝 申請書類"
-            }
-
-            for file_type, file_list in files.items():
-                if file_list:
-                    st.write(f"**{file_type_labels.get(file_type, file_type)}**")
-                    for file_info in file_list:
-                        if "error" not in file_info:
-                            col1, col2 = st.columns([3, 1])
-                            with col1:
-                                st.write(f"- {file_info.get('name', 'unknown')}")
-                                st.caption(f"サイズ: {file_info.get('size', 0):,} bytes")
-                            with col2:
-                                # ファイル内容表示ボタン
-                                if st.button(f"内容表示", key=f"file_{file_info.get('name')}"):
-                                    with st.spinner("ファイルを読み込み中..."):
-                                        mcp_access = file_info.get('mcp_access', {})
-                                        params = mcp_access.get('params', {})
-                                        content = asyncio.run(call_mcp_tool(
-                                            "get_file_content",
-                                            params
-                                        ))
-                                        if "error" in content:
-                                            st.error(f"エラー: {content['error']}")
-                                        elif "content_markdown" in content:
-                                            st.markdown("---")
-                                            st.markdown(f"### 📄 {file_info.get('name')}")
-                                            st.markdown(content['content_markdown'])
-                                        else:
-                                            st.info("このファイルはMarkdown形式で表示できません")
-                        else:
-                            st.error(f"- {file_info.get('name', 'unknown')}: {file_info.get('error')}")
-
-        # 申請URL
-        if detail.get('application_url'):
-            st.subheader("🔗 申請ページ")
-            st.markdown(f"[申請ページを開く]({detail['application_url']})")
-
-        st.info(f"ファイル保存先: {detail.get('save_directory', 'N/A')}")
+                                    # APIレスポンスを整形
+                                    result_data = detail_result.get("result", [])
+                                    if result_data and len(result_data) > 0:
+                                        st.session_state.subsidy_detail = result_data[0]
+                                        st.rerun()
+                                    else:
+                                        st.error("詳細情報が取得できませんでした")
 
 
 if __name__ == "__main__":
