@@ -38,9 +38,11 @@ if 'subsidy_detail' not in st.session_state:
 # JグランツAPI URL（MCPサーバーを経由せず直接APIを呼び出す）
 API_BASE_URL = "https://api.jgrants-portal.go.jp/exp/v1/public"
 
+
 # OpenAI API設定
 try:
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
+    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+    # OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
 except:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
