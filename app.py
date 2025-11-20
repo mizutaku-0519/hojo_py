@@ -13,7 +13,10 @@ import json
 from dotenv import load_dotenv
 
 # 環境変数の読み込み
-load_dotenv()
+# スクリプトのディレクトリを取得して.envファイルのパスを指定
+import pathlib
+env_path = pathlib.Path(__file__).parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 # SSL警告を抑制（企業プロキシ環境対応）
 warnings.filterwarnings('ignore', message='Unverified HTTPS request')
@@ -36,7 +39,17 @@ if 'subsidy_detail' not in st.session_state:
 API_BASE_URL = "https://api.jgrants-portal.go.jp/exp/v1/public"
 
 # OpenAI API設定
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
+try:
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
+except:
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+# デバッグ: APIキーの存在確認（キーの値は表示しない）
+if not OPENAI_API_KEY:
+    import sys
+    print(f"警告: OPENAI_API_KEYが設定されていません", file=sys.stderr)
+    print(f".envファイルパス: {env_path}", file=sys.stderr)
+    print(f".envファイル存在: {env_path.exists()}", file=sys.stderr)
 
 
 async def call_jgrants_api(endpoint: str, params: Dict[str, Any] = None, max_retries: int = 3) -> Dict[str, Any]:
