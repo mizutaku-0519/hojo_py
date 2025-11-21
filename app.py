@@ -154,6 +154,7 @@ def extract_search_params_with_llm(natural_query: str) -> Dict[str, Any]:
 - DX, デジタル化 → 設備整備・IT導入
 - 環境, 脱炭素 → エコ・SDGs活動支援
 - 都道府県名（例：東京都、中部地方、関西など）があれば target_area_search を設定する
+- 都道府県名が設定されたとしても対象地域が全国なものは検索結果に含める
 
 【回答フォーマット（JSONのみ）】
 {
